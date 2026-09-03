@@ -1,0 +1,75 @@
+# Раннер: k8s-executor gitlab-runner в namespace discontools-dev (kubeContext: first),
+# зарегистрирован в GitLab с тегом tools-dev-k8s-runner.
+#
+# Требуемые CI/CD-переменные в этом проекте (Settings → CI/CD → Variables):
+#   CLUSTER_REPO_URL    https-ссылка на cluster-discontools без креденшелов,
+#                       например https://gitlab.com/toolsdiscont/dev/infra/cluster-discontools.git
+#   CLUSTER_REPO_TOKEN  Project Access Token cluster-discontools со scope write_repository (masked, protected).
+#                       Создаётся в Settings → Access Tokens проекта cluster-discontools, роль Developer+.
+#   KUBE_CONFIG         base64(kubeconfig) с контекстом 'first' (для helmfile/helm). Masked.
+#
+# В cluster-discontools нужен ключ tdParser в environments/versions.yaml
+# и helmfile-релиз td-parser (по аналогии с td-catalog).
+
+default:
+  tags: ["tools-dev-k8s-runner"]
+
+variables:
+  REGISTRY: registry.dev.toolsdiscont.com
+  IMAGE_NAME: td-parser
+  SERVICE_KEY: tdParser
+  HELMFILE_RELEASE: td-parser
+  TAG: "$CI_COMMIT_BRANCH-$CI_COMMIT_SHORT_SHA"
+
+stages:
+  - build
+  - deploy
+
+build:
+  stage: build
+  image: docker:27
+  services:
+    - name: docker:27-dind
+      alias: docker
+      # Изнутри кластера регистри доступен по http через traefik: на 443 он отдает
+      # свой самоподписанный сертификат, поэтому демон считает адрес insecure.
+      command: ["--insecure-registry=registry.dev.toolsdiscont.com"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - echo "Building $REGISTRY/$IMAGE_NAME:$TAG"
+    - |
+      for i in $(seq 1 60); do
+        docker info >/dev/null 2>&1 && break
+        echo "Waiting for dockerd... ($i)"; sleep 1
+      done
+    - docker info
+    - docker build -t "$REGISTRY/$IMAGE_NAME:$TAG" .
+    - docker push "$REGISTRY/$IMAGE_NAME:$TAG"
+    - echo "TAG=$TAG" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+
+deploy-dev:
+  stage: deploy
+  image: ghcr.io/helmfile/helmfile:v1.4.4
+  needs:
+    - job: build
+      artifacts: true
+  before_script:
+    - apk add --no-cache yq coreutils
+    - git config --global user.email "ci@toolsdiscont.com"
+    - git config --global user.name "GitLab CI"
+    - mkdir -p ~/.kube && echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
+  script:
+    - AUTH_URL=$(echo "$CLUSTER_REPO_URL" | sed "s|://|://oauth2:${CLUSTER_REPO_TOKEN}@|")
+    - git clone "$AUTH_URL" cluster-repo
+    - cd cluster-repo
+    - ./set-version.sh "$SERVICE_KEY" "$TAG" "$CI_COMMIT_BRANCH"
+    - ./deploy-dev.sh "$HELMFILE_RELEASE"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - when: manual
