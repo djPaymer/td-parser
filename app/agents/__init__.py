@@ -1,3 +1,4 @@
-from app.agents.instruction import AgentError, InstructionAgent, _yandex_model_uri
+from app.agents.instruction import AgentError, BuildResult, InstructionAgent
+from app.agents.llm import LlmClient, LlmError
 
-__all__ = ["AgentError", "InstructionAgent", "_yandex_model_uri"]
+__all__ = ["AgentError", "BuildResult", "InstructionAgent", "LlmClient", "LlmError"]

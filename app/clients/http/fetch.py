@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 import httpx
 from pydantic import BaseModel
@@ -28,7 +29,7 @@ class HtmlFetcher:
         self,
         timeout: float = 45,
         user_agent: str | None = None,
-        max_bytes: int = 500_000,
+        max_bytes: int = 3_000_000,
         delay_seconds: float = 0.35,
         verify_ssl: bool = False,
     ) -> None:
@@ -72,9 +73,39 @@ class HtmlFetcher:
             ) from exc
         except httpx.HTTPError as exc:
             raise HtmlFetchError(f"Failed GET {url}: {exc}") from exc
+        content_type = (response.headers.get("content-type") or "").lower()
+        if content_type and not any(t in content_type for t in HTML_TYPES):
+            raise HtmlFetchError(f"not HTML ({content_type.split(';')[0]}) GET {response.url}")
         raw = response.content[: self._max_bytes]
-        html = raw.decode(response.encoding or "utf-8", errors="replace")
+        html = decode_html(raw, response.charset_encoding)
         return Page(url=str(response.url), status=response.status_code, html=html)
+
+
+HTML_TYPES = ("text/html", "application/xhtml", "text/plain", "application/xml", "text/xml")
+META_CHARSET_RE = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?\s*([\w-]+)""", re.I)
+
+
+def decode_html(raw: bytes, header_charset: str | None) -> str:
+    """Decode with the header charset, else <meta charset>, else UTF-8; never raises."""
+
+    candidates: list[str] = []
+    if header_charset:
+        candidates.append(header_charset)
+    match = META_CHARSET_RE.search(raw[:8192])
+    if match:
+        candidates.append(match.group(1).decode("ascii", errors="ignore"))
+    candidates.append("utf-8")
+    for name in candidates:
+        try:
+            return raw.decode(name)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    for name in candidates:
+        try:
+            return raw.decode(name, errors="replace")
+        except LookupError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def _referer(url: str, site: str | None) -> str:
