@@ -49,7 +49,8 @@ async def process_site(
 ) -> SiteReport:
     site = manufacturer.url
     started = time.monotonic()
-    limit = max_products or settings.parse.max_products
+    # 0 = no limit: every product link the collector finds is downloaded
+    limit = settings.parse.max_products if max_products is None else max_products
     fetcher = make_fetcher(settings)
     report = SiteReport(manufacturer=manufacturer.name, site=site, status="error", products=[])
     try:
@@ -103,7 +104,7 @@ async def process_site(
             notes.append(pattern.reason)
         if failures:
             notes.append(f"{failures} product pages failed to download")
-        if total >= limit:
+        if limit and total >= limit:
             notes.append(f"stopped at the limit of {limit} products")
         with_desc = sum(1 for p in report.products if p.description)
         with_specs = sum(1 for p in report.products if p.specs or p.specs_table)

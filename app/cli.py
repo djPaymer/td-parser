@@ -35,7 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="Excel with manufacturers -> Excel with products")
     run.add_argument("input", help="xlsx with manufacturer sites")
     run.add_argument("output", help="xlsx to write products into")
-    run.add_argument("--max-products", type=int, default=None, help=f"per site (default {settings.parse.max_products})")
+    run.add_argument(
+        "--max-products",
+        type=int,
+        default=None,
+        help=f"cap per site, 0 = all found (default {settings.parse.max_products or 'all'})",
+    )
     run.add_argument("--concurrency", type=int, default=None, help=f"sites in parallel (default {settings.parse.concurrency})")
     run.add_argument("--no-llm", action="store_true", help="choose product shapes heuristically, do not call the LLM")
 

@@ -37,12 +37,13 @@ class AgentConfig(BaseModel):
 class ParseConfig(BaseModel):
     """Limits for collecting product URLs and downloading product pages per site."""
 
-    # non-product pages (home, categories, listings, pager pages) visited while collecting URLs
-    max_listing_pages: int = 150
-    # pager pages followed for one listing
-    max_pages_per_listing: int = 30
-    # product pages downloaded per site (each gives description + specs)
-    max_products: int = 500
+    # non-product pages (home, categories, listings, pager pages) visited while collecting URLs;
+    # a safety net against endless sites, 0 = unlimited
+    max_listing_pages: int = 2000
+    # pager pages followed for one listing, 0 = unlimited
+    max_pages_per_listing: int = 200
+    # product pages downloaded per site (each gives description + specs), 0 = all that were found
+    max_products: int = 0
     # sites processed in parallel (each with its own HTTP client and per-host delay)
     concurrency: int = 3
 

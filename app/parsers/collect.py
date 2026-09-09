@@ -42,6 +42,12 @@ def _key(url: str) -> str:
     return urlunparse((parsed.scheme, parsed.netloc.lower(), path, "", "", "")).lower()
 
 
+def _reached(value: int, limit: int) -> bool:
+    """Limits of 0 mean "unlimited"."""
+
+    return limit > 0 and value >= limit
+
+
 def _without_query(url: str) -> str:
     parsed = urlparse(url)
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path.rstrip("/") or "/", "", "", ""))
@@ -65,6 +71,7 @@ class ProductCollector:
         self._site = origin(site_url)
         self._pattern = pattern
         self._re = pattern.compiled()
+        self._skip_prefixes = {p.lower() for p in pattern.skip_prefixes}
         self._fetcher = fetcher
         self._max_pages = max_listing_pages
         self._max_pager = max_pages_per_listing
@@ -116,9 +123,8 @@ class ProductCollector:
     # ------------------------------------------------------------------ internals
 
     def _done(self) -> bool:
-        return (
-            len(self._result.products) >= self._max_products
-            or self._result.pages_visited >= self._max_pages
+        return _reached(len(self._result.products), self._max_products) or _reached(
+            self._result.pages_visited, self._max_pages
         )
 
     def _pop(self) -> str | None:
@@ -140,7 +146,7 @@ class ProductCollector:
             url = item["url"]
             if url in self._result.products:
                 continue
-            if len(self._result.products) >= self._max_products:
+            if _reached(len(self._result.products), self._max_products):
                 break
             self._result.products[url] = item["name"]
             new += 1
@@ -152,6 +158,8 @@ class ProductCollector:
         for anchor in iter_anchors(page.html, page.url):
             if matches(self._re, anchor) or not is_content_path(anchor.path):
                 continue
+            if self._skip_prefixes and anchor.path.split("/")[1].lower() in self._skip_prefixes:
+                continue  # language mirror of the catalog we are already walking
             key = _key(anchor.url)
             if key in self._visited or key in self._queued:
                 continue
@@ -167,7 +175,9 @@ class ProductCollector:
         param = self._pattern.page_param or detect_page_param(first.html, listing)
         if not param:
             return
-        for number in range(2, self._max_pager + 1):
+        number = 1
+        while not _reached(number, self._max_pager):
+            number += 1
             if self._done():
                 return
             url = with_page(listing, param, number)

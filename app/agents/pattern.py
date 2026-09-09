@@ -24,7 +24,14 @@ from urllib.parse import urlparse
 
 from app.agents.crawl import Crawl, Explorer
 from app.agents.llm import LlmClient, LlmError
-from app.agents.shapes import Shape, expand_sections, shape_by_id, structural_siblings, templates_regex
+from app.agents.shapes import (
+    LOCALE_RE,
+    Shape,
+    expand_sections,
+    shape_by_id,
+    structural_siblings,
+    templates_regex,
+)
 from app.clients.http.fetch import HtmlFetcher, Page
 from app.core.config import AgentConfig
 from app.parsers.links import compile_regex, extract_links
@@ -77,6 +84,8 @@ class ProductPattern:
     regex: str
     name_mode: str = "text"  # where the product name is taken from on listings: text | title
     page_param: str | None = None  # pager query parameter of the listings, if detected
+    # first path segments of language mirrors (/ja, /zh-tw) that duplicate the chosen catalog
+    skip_prefixes: list[str] = field(default_factory=list)
     shapes: list[str] = field(default_factory=list)
     source: str = ""
     confidence: float = 0.0
@@ -213,8 +222,11 @@ class PatternAgent:
             chosen.remove(shape)
         if not chosen:
             raise _Rejected("; ".join(dropped))
+        chosen, locale_dupes = dedupe_locales(chosen, candidates)
+        dropped.extend(locale_dupes)
         if dropped:
             log.info("pattern %s: dropped from %s choice: %s", crawl.site_url, choice.source, "; ".join(dropped))
+        skip_prefixes = locale_mirrors(crawl.shapes, [s.template for s in chosen])
 
         templates = expand_sections([s.template for s in chosen], crawl.shapes)
         regex = templates_regex(templates)
@@ -249,6 +261,7 @@ class PatternAgent:
             regex=regex,
             name_mode=mode,
             page_param=page_param,
+            skip_prefixes=skip_prefixes,
             shapes=[s.text for s in chosen],
             source=choice.source,
             confidence=choice.confidence,
@@ -279,6 +292,54 @@ def heuristic_choice(candidates: list[Shape]) -> Choice:
     runner = candidates[1].score if len(candidates) > 1 else top.score - 3
     confidence = max(0.2, min(0.8, 0.4 + (top.score - runner) / 6))
     return Choice(ids=[top.id], source="heuristic", confidence=round(confidence, 2), reason="best heuristic score")
+
+
+def strip_locale(template: tuple[str, ...]) -> tuple[str, ...]:
+    return template[1:] if len(template) > 1 and LOCALE_RE.match(template[0]) else template
+
+
+def dedupe_locales(chosen: list[Shape], candidates: list[Shape]) -> tuple[list[Shape], list[str]]:
+    """One shape per catalog: ``/product/{N}``, ``/ja/product/{N}`` and ``/zh-tw/product/{N}`` are the same products.
+
+    The variant without a language prefix wins (even if only its localized twin
+    was chosen); otherwise the best-populated locale is kept.
+    """
+
+    groups: dict[tuple[str, ...], list[Shape]] = {}
+    for shape in chosen:
+        groups.setdefault(strip_locale(shape.template), []).append(shape)
+    by_template = {s.template: s for s in candidates}
+    kept: list[Shape] = []
+    dropped: list[str] = []
+    for stripped, group in groups.items():
+        keep = by_template.get(stripped) or max(group, key=lambda s: s.count)
+        if keep.nav_ratio > MAX_NAV_RATIO or keep.leaf is False:
+            keep = max(group, key=lambda s: s.count)
+        kept.append(keep)
+        dropped.extend(f"{s.text} is a language variant of {keep.text}" for s in group if s is not keep)
+    return kept, dropped
+
+
+def locale_mirrors(shapes: list[Shape], kept: list[tuple[str, ...]]) -> list[str]:
+    """Language prefixes whose sections mirror another section of the site (``/ja`` when ``/ja/products/...``
+    repeats ``/products/...``), except the prefix the chosen product shapes live under."""
+
+    groups: dict[tuple[str, ...], set[str]] = {}  # template without locale -> locales seen ("" = none)
+    for shape in shapes:
+        stripped = strip_locale(shape.template)
+        if stripped:
+            groups.setdefault(stripped, set()).add(shape.template[0] if stripped != shape.template else "")
+    evidence: dict[str, int] = {}
+    for stripped, members in groups.items():
+        if len(members) < 2:
+            continue
+        for prefix in members:
+            if prefix:
+                # a deep mirrored section is proof on its own; shallow ones (/xx/{*} vs /{*}) need a second section
+                evidence[prefix] = evidence.get(prefix, 0) + (2 if len(stripped) >= 2 else 1)
+    mirrors = {prefix for prefix, score in evidence.items() if score >= 2}
+    mirrors -= {t[0] for t in kept if strip_locale(t) != t}
+    return sorted(mirrors)
 
 
 def name_mode(shapes: list[Shape]) -> str:
