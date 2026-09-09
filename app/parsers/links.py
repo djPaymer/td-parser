@@ -6,7 +6,6 @@ from html import unescape
 from urllib.parse import unquote, urlparse
 
 from app.clients.http.urls import abs_url, host_key
-from app.parsers.schema import LinksSpec
 
 A_TAG_RE = re.compile(r"<a\b([^>]*)>(.*?)</a>", re.I | re.S)
 ATTR_RE = re.compile(
@@ -131,48 +130,33 @@ def iter_anchors(html: str, base_url: str) -> list[Anchor]:
     return out
 
 
-def _matches(spec_re: re.Pattern[str] | None, anchor: Anchor) -> bool:
-    if spec_re is None:
-        return True
-    return bool(
-        spec_re.search(anchor.href) or spec_re.search(anchor.url) or spec_re.search(anchor.path)
-    )
+def matches(regex: re.Pattern[str], anchor: Anchor) -> bool:
+    """The product regex is matched against the raw href, the absolute URL and the path."""
+
+    return bool(regex.search(anchor.href) or regex.search(anchor.url) or regex.search(anchor.path))
 
 
 def _pick_name(anchor: Anchor, mode: str) -> str:
     if mode == "title":
         return anchor.title or anchor.text or slug_name(anchor.url)
-    if mode == "slug":
-        return slug_name(anchor.url)
     return anchor.text or anchor.title or slug_name(anchor.url)
 
 
 def _name_quality(anchor: Anchor, mode: str) -> int:
-    if mode == "slug":
-        return 0
     if mode == "title":
         return 2 if anchor.title else 1 if anchor.text else 0
     return 2 if anchor.text else 1 if anchor.title else 0
 
 
-def extract_links(html: str, spec: LinksSpec, base_url: str) -> list[dict[str, str | None]]:
-    """Links matching the spec. One row per URL; the best available name wins."""
+def extract_links(
+    html: str, product_re: re.Pattern[str], base_url: str, name_mode: str = "text"
+) -> list[dict[str, str]]:
+    """Product links on the page. One row per URL; the best available name wins."""
 
-    href_re = compile_regex(spec.href, "links.href")
-    path_re = compile_regex(spec.path, "links.path")
-    skip_re = compile_regex(spec.skip_href, "links.skip_href")
-    class_need = spec.css_class
-    name_mode = spec.name or "text"
-    found: dict[str, dict[str, str | None]] = {}
+    found: dict[str, dict[str, str]] = {}
     quality: dict[str, int] = {}
     for anchor in iter_anchors(html, base_url):
-        if class_need and class_need not in anchor.css_class:
-            continue
-        if skip_re and (skip_re.search(anchor.href) or skip_re.search(anchor.url)):
-            continue
-        if not _matches(href_re, anchor):
-            continue
-        if path_re and not path_re.search(anchor.path):
+        if not matches(product_re, anchor):
             continue
         q = _name_quality(anchor, name_mode)
         if anchor.url in found:

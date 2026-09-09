@@ -2,15 +2,14 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 PYTHONUTF8=1
 
 RUN pip install poetry
 
 COPY pyproject.toml poetry.lock ./
-RUN poetry config virtualenvs.create false && poetry install --without dev
+RUN poetry config virtualenvs.create false && poetry install --without dev --no-root
 
 COPY app/ ./app/
-COPY alembic.ini ./
-COPY alembic/ ./alembic/
 
-CMD ["uvicorn", "app.main:main_app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["python", "-m", "app"]
+CMD ["--help"]

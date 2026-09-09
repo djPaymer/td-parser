@@ -1,4 +1,4 @@
-"""Build a scrape instruction for a manufacturer site.
+"""Derive the product-URL regex of a manufacturer site.
 
 Pipeline:
 
@@ -7,11 +7,11 @@ Pipeline:
 2. The LLM is shown the top shapes with statistics and examples and only has to
    *choose* which shape(s) are product-detail pages.  If the LLM is not
    configured or fails, a heuristic ranking makes the choice instead.
-3. Code (not the LLM) turns the choice into an instruction: product regex,
-   catalog entry URL, category regex for descending, pagination parameter.
-4. The instruction is validated against the downloaded pages; a choice that
-   matches too few links or looks like navigation is rejected and the next
-   candidate is tried.
+3. Code (not the LLM) turns the choice into an anchored regex and detects the
+   pagination parameter of the listing pages.
+4. The regex is validated against the downloaded pages; a choice that matches
+   too few links or looks like navigation is rejected and the next candidate is
+   tried.
 """
 
 from __future__ import annotations
@@ -24,24 +24,11 @@ from urllib.parse import urlparse
 
 from app.agents.crawl import Crawl, Explorer
 from app.agents.llm import LlmClient, LlmError
-from app.agents.shapes import (
-    HEX,
-    NUM,
-    WILD,
-    Shape,
-    expand_sections,
-    shape_by_id,
-    structural_siblings,
-    template_text,
-    templates_regex,
-    tokenize,
-)
-from app.clients.http.fetch import HtmlFetchError, HtmlFetcher, Page
-from app.clients.http.urls import abs_url, origin
+from app.agents.shapes import Shape, expand_sections, shape_by_id, structural_siblings, templates_regex
+from app.clients.http.fetch import HtmlFetcher, Page
 from app.core.config import AgentConfig
 from app.parsers.links import compile_regex, extract_links
 from app.parsers.paginate import detect_page_param
-from app.parsers.schema import CategoriesSpec, LinksSpec, PaginationSpec, SiteInstruction
 
 log = logging.getLogger(__name__)
 
@@ -84,12 +71,32 @@ class Choice:
 
 
 @dataclass(slots=True)
-class BuildResult:
-    instruction: SiteInstruction
+class ProductPattern:
+    """Everything needed to harvest product URLs from a site."""
+
+    regex: str
+    name_mode: str = "text"  # where the product name is taken from on listings: text | title
+    page_param: str | None = None  # pager query parameter of the listings, if detected
+    shapes: list[str] = field(default_factory=list)
+    source: str = ""
+    confidence: float = 0.0
+    reason: str = ""
+
+    def compiled(self) -> re.Pattern[str]:
+        pattern = compile_regex(self.regex, "product regex")
+        assert pattern is not None
+        return pattern
+
+
+@dataclass(slots=True)
+class PatternResult:
+    pattern: ProductPattern
+    crawl: Crawl  # the pages downloaded while exploring; the collector reuses them
+    listing_pages: list[str]  # pages where several product links were seen
     meta: dict[str, Any] = field(default_factory=dict)
 
 
-class InstructionAgent:
+class PatternAgent:
     def __init__(self, config: AgentConfig, llm: LlmClient | None = None) -> None:
         self._config = config
         self._llm = llm
@@ -98,19 +105,19 @@ class InstructionAgent:
     def has_llm(self) -> bool:
         return self._llm is not None
 
-    async def build_instruction(self, site_url: str, fetcher: HtmlFetcher) -> BuildResult:
+    async def build_pattern(self, site_url: str, fetcher: HtmlFetcher) -> PatternResult:
         crawl = await Explorer(fetcher, self._config.max_pages).run(site_url)
         links_seen = len(crawl.index.links)
         if links_seen < MIN_LINKS_FOR_ANALYSIS:
             raise AgentError(
-                f"{site_url}: only {links_seen} internal links found in HTML; "
+                f"only {links_seen} internal links found in HTML; "
                 "the site is probably rendered by JavaScript or blocks bots"
             )
         candidates = [s for s in crawl.shapes if not s.literal and s.count >= 2]
         candidates = candidates[: self._config.max_candidates]
         if not candidates:
             raise AgentError(
-                f"{site_url}: no repeating URL shapes among {links_seen} links "
+                f"no repeating URL shapes among {links_seen} links "
                 f"(pages: {', '.join(p.url for p in crawl.pages)})"
             )
 
@@ -121,7 +128,7 @@ class InstructionAgent:
                 choices.append(await self._ask_llm(crawl, candidates))
             except LlmError as exc:
                 llm_error = str(exc)
-                log.warning("instruction %s: LLM failed, using heuristics: %s", site_url, exc)
+                log.warning("pattern %s: LLM failed, using heuristics: %s", site_url, exc)
         choices.append(heuristic_choice(candidates))
 
         errors: list[str] = []
@@ -132,14 +139,14 @@ class InstructionAgent:
                 continue
             tried.add(key)
             try:
-                result = await self._assemble(crawl, candidates, choice, fetcher)
+                result = self._assemble(crawl, candidates, choice)
             except _Rejected as exc:
                 errors.append(f"{choice.source} {list(key)}: {exc}")
-                log.info("instruction %s: rejected %s choice %s: %s", site_url, choice.source, key, exc)
+                log.info("pattern %s: rejected %s choice %s: %s", site_url, choice.source, key, exc)
                 continue
             result.meta["llm_error"] = llm_error or None
             result.meta["rejected"] = errors
-            log.info("instruction %s: %s", site_url, result.instruction.model_dump(exclude_none=True))
+            log.info("pattern %s: %s (%s, %.2f)", site_url, result.pattern.regex, choice.source, choice.confidence)
             return result
 
         shapes_seen = "; ".join(f"#{s.id} {s.text} ({s.stats_line()})" for s in candidates[:6])
@@ -151,7 +158,7 @@ class InstructionAgent:
                 "so the catalog is most likely rendered by JavaScript."
             )
         raise AgentError(
-            f"{site_url}: could not build an instruction. "
+            "could not derive a product regex. "
             + (" | ".join(errors) if errors else "no shape was chosen.")
             + f" Shapes seen: {shapes_seen}."
             + hint
@@ -179,18 +186,12 @@ class InstructionAgent:
         except (TypeError, ValueError):
             confidence = 0.0
         reason = str(payload.get("reason") or "")[:300]
-        log.info("instruction %s: LLM chose %s (%.2f) %s", crawl.site_url, ids, confidence, reason)
+        log.info("pattern %s: LLM chose %s (%.2f) %s", crawl.site_url, ids, confidence, reason)
         return Choice(ids=ids, source="llm", confidence=max(0.0, min(confidence, 1.0)), reason=reason)
 
     # ------------------------------------------------------------------ assembly
 
-    async def _assemble(
-        self,
-        crawl: Crawl,
-        candidates: list[Shape],
-        choice: Choice,
-        fetcher: HtmlFetcher,
-    ) -> BuildResult:
+    def _assemble(self, crawl: Crawl, candidates: list[Shape], choice: Choice) -> PatternResult:
         chosen = shape_by_id(candidates, choice.ids)
         if not chosen:
             raise _Rejected("no valid shape ids")
@@ -213,18 +214,19 @@ class InstructionAgent:
         if not chosen:
             raise _Rejected("; ".join(dropped))
         if dropped:
-            log.info("instruction %s: dropped from %s choice: %s", crawl.site_url, choice.source, "; ".join(dropped))
+            log.info("pattern %s: dropped from %s choice: %s", crawl.site_url, choice.source, "; ".join(dropped))
 
         templates = expand_sections([s.template for s in chosen], crawl.shapes)
-        spec = LinksSpec(href=templates_regex(templates), name=name_mode(chosen))
-        product_re = compile_regex(spec.href, "links.href")
+        regex = templates_regex(templates)
+        product_re = compile_regex(regex, "product regex")
         assert product_re is not None
+        mode = name_mode(chosen)
 
         hits_by_page: list[tuple[Page, int]] = []
         distinct: set[str] = set()
         for page in crawl.pages:
-            found = extract_links(page.html, spec, page.url)
-            distinct.update(item["url"] or "" for item in found)
+            found = extract_links(page.html, product_re, page.url, mode)
+            distinct.update(item["url"] for item in found)
             hits_by_page.append((page, len(found)))
         if len(distinct) < self._config.min_hits:
             raise _Rejected(f"matched only {len(distinct)} product links on {len(crawl.pages)} pages")
@@ -237,29 +239,22 @@ class InstructionAgent:
         if not listing_pages:
             raise _Rejected("product links were seen only on product pages")
 
-        root = await self._pick_root(crawl, templates, listing_pages, fetcher)
-        if product_re.search(root):
-            raise _Rejected(f"product regex matches the catalog entry {root}")
-        categories = category_regex(root, templates, listing_pages)
-        pagination = None
+        page_param = None
         for page, _ in listing_pages[:3]:
-            param = detect_page_param(page.html, page.url)
-            if param:
-                pagination = PaginationSpec(param=param)
+            page_param = detect_page_param(page.html, page.url)
+            if page_param:
                 break
 
-        instruction = SiteInstruction(
-            engine="html",
-            url=root,
-            links=spec,
-            categories=CategoriesSpec(href=categories) if categories else None,
-            pagination=pagination,
+        pattern = ProductPattern(
+            regex=regex,
+            name_mode=mode,
+            page_param=page_param,
+            shapes=[s.text for s in chosen],
+            source=choice.source,
+            confidence=choice.confidence,
+            reason=choice.reason,
         )
         meta = {
-            "source": choice.source,
-            "confidence": choice.confidence,
-            "reason": choice.reason,
-            "shapes": [s.text for s in chosen],
             "dropped": dropped,
             "hits": len(distinct),
             "listing_pages": [{"url": p.url, "hits": n} for p, n in listing_pages[:10]],
@@ -271,41 +266,9 @@ class InstructionAgent:
                 for s in candidates
             ],
         }
-        return BuildResult(instruction=instruction, meta=meta)
-
-    async def _pick_root(
-        self,
-        crawl: Crawl,
-        product_templates: list[tuple[str, ...]],
-        listing_pages: list[tuple[Page, int]],
-        fetcher: HtmlFetcher,
-    ) -> str:
-        """Catalog entry path.
-
-        Preferably the static prefix shared by the pages where products were actually
-        listed (``/products``), else the prefix of the product URLs themselves
-        (``/product`` for ``/product/{N}``) if that is a real page, else the home page.
-        """
-
-        fetched = {_path_of(p.url) for p in crawl.pages}
-        failed = {_path_of(u) for u in crawl.failures}
-        listing_templates = [tokenize(_path_of(p.url)) for p, _ in listing_pages]
-        for path in (literal_prefix(listing_templates), literal_prefix(product_templates)):
-            if not path or path == "/":
-                continue
-            if path in fetched:
-                return path
-            if path in failed:
-                continue
-            try:
-                page = await fetcher.get(abs_url(origin(crawl.site_url), path), origin=crawl.site_url)
-            except HtmlFetchError:
-                crawl.failures.append(path)
-                continue
-            crawl.pages.append(page)
-            crawl.index.add_page(page)
-            return path
-        return "/"
+        return PatternResult(
+            pattern=pattern, crawl=crawl, listing_pages=[p.url for p, _ in listing_pages], meta=meta
+        )
 
 
 # ---------------------------------------------------------------------- helpers
@@ -325,53 +288,6 @@ def name_mode(shapes: list[Shape]) -> str:
     if text < 0.5 <= title and title > text:
         return "title"
     return "text"
-
-
-def literal_prefix(templates: list[tuple[str, ...]]) -> str:
-    """Common leading literal segments of the templates (``/product/{N}`` -> ``/product``)."""
-
-    if not templates:
-        return "/"
-    prefix: list[str] = []
-    for pos in range(min(len(t) for t in templates)):
-        tokens = {t[pos] for t in templates}
-        if len(tokens) != 1:
-            break
-        token = next(iter(tokens))
-        if WILD in token or NUM in token or HEX in token:
-            break
-        prefix.append(token)
-    return template_text(tuple(prefix))
-
-
-def category_regex(
-    root: str,
-    product_templates: list[tuple[str, ...]],
-    listing_pages: list[tuple[Page, int]],
-) -> str | None:
-    """Regex for category pages below ``root`` that the parser may follow.
-
-    Covers the listing pages where products were actually seen, every
-    intermediate level between ``root`` and those pages, and every intermediate
-    level between ``root`` and the product templates.
-    """
-
-    root_tpl = tuple(s for s in root.split("/") if s)
-    depth = len(root_tpl)
-    found: set[tuple[str, ...]] = set()
-    for page, _ in listing_pages:
-        tpl = tokenize(_path_of(page.url))
-        for k in range(depth + 1, len(tpl) + 1):
-            found.add(tpl[:k])
-    for tpl in product_templates:
-        for k in range(depth + 1, len(tpl)):
-            found.add(tpl[:k])
-    found.discard(root_tpl)
-    if depth:
-        found = {t for t in found if t[:depth] == root_tpl}
-    if not found:
-        return None
-    return templates_regex(sorted(found, key=lambda t: (len(t), t)))
 
 
 def format_candidates(crawl: Crawl, candidates: list[Shape]) -> str:

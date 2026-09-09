@@ -1,22 +1,18 @@
 [project]
 name = "td-parser"
-version = "0.1.0"
-description = "HTTP API: scrape manufacturer sites for product URLs"
+version = "0.2.0"
+description = "CLI: collect products (URL, name, description, specs) from manufacturer sites listed in an Excel file"
 authors = [
     {name = "selin.pa",email = "selin.pa@krskcit.ru"}
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi (>=0.141.1,<0.142.0)",
     "httpx (>=0.28.1,<0.29.0)",
     "pydantic-settings (>=2.15.0,<3.0.0)",
-    "uvicorn[standard] (>=0.52.4,<0.53.0)",
-    "orjson (>=3.12.0,<4.0.0)",
     "openai (>=3.7.0,<4.0.0)",
-    "sqlalchemy (>=2.0,<3)",
-    "asyncpg (>=0.30)",
-    "psycopg[binary] (>=3.2)",
-    "alembic (>=1.16)"
+    "openpyxl (>=3.1,<4.0)",
+    "beautifulsoup4 (>=4.12,<5.0)",
+    "lxml (>=5.0,<7.0)"
 ]
 
 [tool.poetry]

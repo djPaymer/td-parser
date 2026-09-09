@@ -4,20 +4,6 @@ from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class RunConfig(BaseModel):
-    host: str = "0.0.0.0"
-    port: int = 8000
-
-
-class ApiV1Prefix(BaseModel):
-    prefix: str = "/v1"
-
-
-class ApiPrefix(BaseModel):
-    prefix: str = "/api"
-    v1: ApiV1Prefix = ApiV1Prefix()
-
-
 class FetchConfig(BaseModel):
     timeout: float = 45
     delay_seconds: float = 0.35
@@ -31,6 +17,8 @@ class FetchConfig(BaseModel):
 
 
 class AgentConfig(BaseModel):
+    """LLM access and the exploration budget used to derive the product URL regex."""
+
     api_key: str = ""
     base_url: str = "https://ai.api.cloud.yandex.net/v1"
     model: str = "deepseek-v4-flash/latest"
@@ -38,23 +26,25 @@ class AgentConfig(BaseModel):
     temperature: float = 0.1
     # reasoning models (deepseek) spend hidden tokens before the answer; keep this generous
     max_output_tokens: int = 4000
-    # exploration budget: how many pages of the site to download while building an instruction
+    # exploration budget: how many pages of the site to download while deriving the regex
     max_pages: int = 16
     # how many URL shapes are offered to the LLM
     max_candidates: int = 10
-    # an instruction is accepted only if it matches at least this many product links on fetched pages
+    # a regex is accepted only if it matches at least this many product links on fetched pages
     min_hits: int = 3
 
 
-class DbConfig(BaseModel):
-    # PostgreSQL DSN, e.g. postgresql://service:service@localhost:5432/parser
-    # Empty string disables instruction persistence
-    url: str = ""
+class ParseConfig(BaseModel):
+    """Limits for collecting product URLs and downloading product pages per site."""
 
-
-class StoreConfig(BaseModel):
-    # POST /instruction returns the stored instruction when it is younger than this (0 = always rebuild)
-    ttl_days: int = 30
+    # non-product pages (home, categories, listings, pager pages) visited while collecting URLs
+    max_listing_pages: int = 150
+    # pager pages followed for one listing
+    max_pages_per_listing: int = 30
+    # product pages downloaded per site (each gives description + specs)
+    max_products: int = 500
+    # sites processed in parallel (each with its own HTTP client and per-host delay)
+    concurrency: int = 3
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -68,12 +58,9 @@ class Settings(BaseSettings):
         env_nested_delimiter="__",
         env_prefix="APP_CONFIG__",
     )
-    run: RunConfig = RunConfig()
-    api: ApiPrefix = ApiPrefix()
     fetch: FetchConfig = FetchConfig()
     agent: AgentConfig = AgentConfig()
-    db: DbConfig = DbConfig()
-    store: StoreConfig = StoreConfig()
+    parse: ParseConfig = ParseConfig()
 
 
 settings = Settings()
