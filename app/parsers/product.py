@@ -27,6 +27,10 @@ NOISE_CLASS_RE = re.compile(
     r"related|recommend|similar|also-like|newsletter|subscribe|inquiry|enquiry|login|search",
     re.I,
 )
+# "ast-no-sidebar", "without-nav", "menu-hidden": the class says the noise is absent, not present
+NEGATED_CLASS_RE = re.compile(r"(?:^|[-_])(?:no|non|without|hide|hidden|has-no)(?:[-_]|$)", re.I)
+# the page skeleton is never noise, whatever its classes say (body.ast-no-sidebar took whole pages down)
+SKELETON_TAGS = {"html", "body", "main", "article"}
 SPEC_CONTAINER_RE = re.compile(
     r"spec|param|attr|feature|tech|charact|properties|detail|harakt|характ|параметр|参数|规格|技术",
     re.I,
@@ -89,9 +93,7 @@ def extract_product(html: str, url: str, fallback_name: str = "") -> ProductData
 
     for tag in soup.find_all(NOISE_TAGS):
         tag.decompose()
-    for tag in soup.find_all(True, attrs={"class": NOISE_CLASS_RE}):
-        tag.decompose()
-    for tag in soup.find_all(True, id=NOISE_CLASS_RE):
+    for tag in [t for t in soup.find_all(True) if _is_noise(t)]:
         tag.decompose()
     for br in soup.find_all("br"):
         br.replace_with("\n")  # keeps "Key: value<br>Key: value" blocks splittable
@@ -129,6 +131,16 @@ def extract_product(html: str, url: str, fallback_name: str = "") -> ProductData
 
 
 # --------------------------------------------------------------------------- sources
+
+
+def _is_noise(tag: Tag) -> bool:
+    if tag.name in SKELETON_TAGS:
+        return False
+    tokens = list(tag.get("class") or [])
+    ident = tag.get("id")
+    if ident:
+        tokens.append(str(ident))
+    return any(NOISE_CLASS_RE.search(t) and not NEGATED_CLASS_RE.search(t) for t in tokens)
 
 
 def _json_ld_product(soup: BeautifulSoup) -> dict[str, Any]:

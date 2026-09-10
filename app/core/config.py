@@ -6,6 +6,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class FetchConfig(BaseModel):
     timeout: float = 45
+    # reachability check of the home page before a site takes a concurrency slot
+    preflight_timeout: float = 15
     delay_seconds: float = 0.35
     # catalog pages with inline mega-menus / base64 images reach 1 MB; truncating them hides the products
     max_bytes: int = 3_000_000
@@ -34,6 +36,18 @@ class AgentConfig(BaseModel):
     min_hits: int = 3
 
 
+class BrowserConfig(BaseModel):
+    """Headless Chromium (Playwright) fallback for JavaScript-rendered sites and 403 walls."""
+
+    enabled: bool = True
+    # page load timeout
+    timeout: float = 30
+    # extra wait after load for single-page apps to fill the DOM
+    settle_seconds: float = 0.8
+    # product pages parsed before deciding that the http HTML is empty and switching to the browser
+    probe_products: int = 5
+
+
 class ParseConfig(BaseModel):
     """Limits for collecting product URLs and downloading product pages per site."""
 
@@ -42,6 +56,8 @@ class ParseConfig(BaseModel):
     max_listing_pages: int = 2000
     # pager pages followed for one listing, 0 = unlimited
     max_pages_per_listing: int = 200
+    # stop walking a site after this many pages in a row without a new product link (0 = never)
+    max_stale_pages: int = 300
     # product pages downloaded per site (each gives description + specs), 0 = all that were found
     max_products: int = 0
     # sites processed in parallel (each with its own HTTP client and per-host delay)
@@ -61,6 +77,7 @@ class Settings(BaseSettings):
     )
     fetch: FetchConfig = FetchConfig()
     agent: AgentConfig = AgentConfig()
+    browser: BrowserConfig = BrowserConfig()
     parse: ParseConfig = ParseConfig()
 
 

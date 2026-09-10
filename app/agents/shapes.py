@@ -43,6 +43,8 @@ CATALOG_ENTRY_RE = re.compile(
     r"productcenter|product_center|cp|chanpin|our-products|all-products|product-list)$",
     re.I,
 )
+# /product.aspx, /products.php, /catalog.html are catalog entries too
+PAGE_EXT_RE = re.compile(r"\.(?:aspx?|php\d?|html?|shtml|jsp|cfm|do)$", re.I)
 
 
 # --------------------------------------------------------------------------- tokens
@@ -513,7 +515,7 @@ def catalog_entry_links(index: LinkIndex) -> list[LinkInfo]:
     out: list[LinkInfo] = []
     for info in index.links.values():
         segs = [s for s in info.path.split("/") if s]
-        if segs and len(segs) <= 2 and CATALOG_ENTRY_RE.match(unquote(segs[-1])):
+        if segs and len(segs) <= 2 and CATALOG_ENTRY_RE.match(PAGE_EXT_RE.sub("", unquote(segs[-1]))):
             out.append(info)
     out.sort(key=lambda l: (len(l.path.split("/")), -len(l.pages)))
     return out

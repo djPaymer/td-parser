@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from typing import Protocol
 
 import httpx
 from pydantic import BaseModel
@@ -22,8 +23,16 @@ class HtmlFetchError(RuntimeError):
     pass
 
 
+class Fetcher(Protocol):
+    """What the crawler, collector and runner need: ``HtmlFetcher`` (httpx) or ``BrowserFetcher`` (Playwright)."""
+
+    async def get(self, url: str, *, origin: str | None = None) -> Page: ...
+
+    async def aclose(self) -> None: ...
+
+
 class HtmlFetcher:
-    """Downloads HTML pages. Does not talk to TD Catalog."""
+    """Downloads HTML pages over plain HTTP; the fast path that works for server-rendered sites."""
 
     def __init__(
         self,

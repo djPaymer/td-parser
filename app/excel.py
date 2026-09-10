@@ -39,7 +39,7 @@ class Manufacturer:
 class SiteReport:
     manufacturer: str
     site: str
-    status: str  # ok | empty | error
+    status: str  # ok | empty | unavailable | error (see app.runner)
     products: list[ProductData]
     regex: str = ""
     source: str = ""

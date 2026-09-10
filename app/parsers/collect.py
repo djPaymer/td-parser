@@ -18,7 +18,7 @@ from urllib.parse import urlparse, urlunparse
 
 from app.agents.pattern import ProductPattern
 from app.agents.shapes import tokenize
-from app.clients.http.fetch import HtmlFetchError, HtmlFetcher, Page
+from app.clients.http.fetch import Fetcher, HtmlFetchError, Page
 from app.clients.http.urls import origin
 from app.parsers.links import extract_links, is_content_path, iter_anchors, matches
 from app.parsers.paginate import detect_page_param
@@ -62,11 +62,12 @@ class ProductCollector:
         self,
         site_url: str,
         pattern: ProductPattern,
-        fetcher: HtmlFetcher,
+        fetcher: Fetcher,
         *,
         max_listing_pages: int,
         max_pages_per_listing: int,
         max_products: int,
+        max_stale_pages: int = 0,
     ) -> None:
         self._site = origin(site_url)
         self._pattern = pattern
@@ -76,6 +77,8 @@ class ProductCollector:
         self._max_pages = max_listing_pages
         self._max_pager = max_pages_per_listing
         self._max_products = max_products
+        self._max_stale = max_stale_pages
+        self._stale = 0  # pages fetched since the last new product link
         self._result = CollectResult()
         self._visited: set[str] = set()
         self._queued: set[str] = set()
@@ -102,6 +105,14 @@ class ProductCollector:
                 break
 
         while not self._done():
+            if _reached(self._stale, self._max_stale):
+                # a small catalog on a big corporate site: the products were all found long ago and
+                # the queue holds only news, careers and the like
+                log.info(
+                    "collect %s: %d pages without a new product, stopping (%d queued)",
+                    self._site, self._stale, len(self._hot) + len(self._cold),
+                )
+                break
             url = self._pop()
             if url is None:
                 break
@@ -155,6 +166,7 @@ class ProductCollector:
     async def _ingest(self, page: Page) -> None:
         found = extract_links(page.html, self._re, page.url, self._pattern.name_mode)
         new = self._record(found)
+        self._stale = 0 if new else self._stale + 1
         for anchor in iter_anchors(page.html, page.url):
             if matches(self._re, anchor) or not is_content_path(anchor.path):
                 continue
@@ -191,3 +203,4 @@ class ProductCollector:
             found = extract_links(page.html, self._re, page.url, self._pattern.name_mode)
             if not found or self._record(found) == 0:
                 return
+            self._stale = 0

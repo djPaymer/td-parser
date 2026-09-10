@@ -18,13 +18,16 @@ import asyncio
 import json
 import logging
 import sys
+from collections import Counter
 from dataclasses import asdict
 
 from app.core.config import settings
 from app.excel import Manufacturer, ResultWorkbook, SiteReport, normalize_site_url, read_manufacturers
-from app.runner import make_fetcher, make_llm, process_site
+from app.runner import make_browser, make_fetcher, make_llm, preflight, process_site
 
 log = logging.getLogger("app")
+
+PREFLIGHT_CONCURRENCY = 8  # home-page reachability checks in flight at once
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,10 +46,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--concurrency", type=int, default=None, help=f"sites in parallel (default {settings.parse.concurrency})")
     run.add_argument("--no-llm", action="store_true", help="choose product shapes heuristically, do not call the LLM")
+    run.add_argument("--no-browser", action="store_true", help="never fall back to headless Chromium")
 
     pattern = sub.add_parser("pattern", help="derive and print the product regex of one site")
     pattern.add_argument("url")
     pattern.add_argument("--no-llm", action="store_true")
+    pattern.add_argument("--browser", action="store_true", help="read the site with headless Chromium instead of httpx")
     return parser
 
 
@@ -72,32 +77,56 @@ async def run_command(args: argparse.Namespace) -> int:
         return 2
     log.info("%d manufacturers from %s", len(manufacturers), args.input)
     llm = None if args.no_llm else make_llm(settings)
+    browser = None if args.no_browser else await make_browser(settings)
     semaphore = asyncio.Semaphore(args.concurrency or settings.parse.concurrency)
+    preflight_slots = asyncio.Semaphore(PREFLIGHT_CONCURRENCY)
 
     async def guarded(item: Manufacturer) -> SiteReport:
+        # the reachability check runs outside the worker semaphore: a dead domain, a TLS
+        # failure or a 403 wall is reported at once and never blocks a real site
+        async with preflight_slots:
+            check = await preflight(item, settings, browser)
+        if not check.reachable:
+            return SiteReport(item.name, item.url, "unavailable", [], note=check.note)
         async with semaphore:
             try:
-                return await process_site(item, settings, llm, max_products=args.max_products)
+                report = await process_site(
+                    item, settings, llm, browser, mode=check.mode, max_products=args.max_products
+                )
             except Exception as exc:  # one broken site must not abort the batch
                 log.exception("%s: unexpected failure", item.url)
                 return SiteReport(item.name, item.url, "error", [], note=f"{type(exc).__name__}: {exc}")
+        if check.note and check.note not in report.note:
+            report.note = "; ".join(filter(None, [check.note, report.note]))
+        return report
 
     reports: dict[str, SiteReport] = {}
-    tasks = {asyncio.create_task(guarded(item)): item for item in manufacturers}
-    for task in asyncio.as_completed(tasks):
-        report = await task
-        reports[report.site] = report
-        workbook = ResultWorkbook(args.output)  # rebuilt each time so rows keep the input order
-        for item in manufacturers:
-            if item.url in reports:
-                workbook.add(reports[item.url])
-        workbook.save()
-        log.info("saved %s (%d/%d sites)", args.output, len(reports), len(manufacturers))
+    try:
+        tasks = {asyncio.create_task(guarded(item)): item for item in manufacturers}
+        for task in asyncio.as_completed(tasks):
+            report = await task
+            reports[report.site] = report
+            workbook = ResultWorkbook(args.output)  # rebuilt each time so rows keep the input order
+            for item in manufacturers:
+                if item.url in reports:
+                    workbook.add(reports[item.url])
+            workbook.save()
+            log.info("saved %s (%d/%d sites)", args.output, len(reports), len(manufacturers))
+    finally:
+        if browser is not None:
+            await browser.aclose()
 
-    ok = sum(1 for r in reports.values() if r.status == "ok")
+    by_status = Counter(r.status for r in reports.values())
     products = sum(len(r.products) for r in reports.values())
-    log.info("finished: %d/%d sites ok, %d products -> %s", ok, len(manufacturers), products, args.output)
-    return 0 if ok else 1
+    log.info(
+        "finished: %d/%d sites ok (%s), %d products -> %s",
+        by_status.get("ok", 0),
+        len(manufacturers),
+        ", ".join(f"{k} {v}" for k, v in sorted(by_status.items())),
+        products,
+        args.output,
+    )
+    return 0 if by_status.get("ok") else 1
 
 
 async def pattern_command(args: argparse.Namespace) -> int:
@@ -109,7 +138,14 @@ async def pattern_command(args: argparse.Namespace) -> int:
         log.error("not a site URL: %s", args.url)
         return 2
     llm = None if args.no_llm else make_llm(settings)
-    fetcher = make_fetcher(settings)
+    browser = None
+    if args.browser:
+        browser = await make_browser(settings)
+        if browser is None:
+            return 2
+        fetcher = browser.fetcher(settings.fetch.delay_seconds)
+    else:
+        fetcher = make_fetcher(settings)
     try:
         result = await PatternAgent(settings.agent, llm).build_pattern(url, fetcher)
     except (AgentError, HtmlFetchError) as exc:
@@ -117,7 +153,16 @@ async def pattern_command(args: argparse.Namespace) -> int:
         return 1
     finally:
         await fetcher.aclose()
-    payload = {"site": url, "pattern": asdict(result.pattern), "listing_pages": result.listing_pages, "meta": result.meta}
+        if browser is not None:
+            await browser.aclose()
+    payload = {
+        "site": url,
+        "catalog": result.crawl.site_url,
+        "moved": result.crawl.moved_reason,
+        "pattern": asdict(result.pattern),
+        "listing_pages": result.listing_pages,
+        "meta": result.meta,
+    }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 

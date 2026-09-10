@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from html import unescape
 from urllib.parse import unquote, urlparse
@@ -100,6 +101,34 @@ def compile_regex(pattern: str | None, field: str = "regex") -> re.Pattern[str] 
         return re.compile(pattern, re.I)
     except re.error as exc:
         raise ValueError(f"invalid {field} regex {pattern!r}: {exc}") from exc
+
+
+SHARED_HOST_RE = re.compile(
+    r"(?:^|\.)(?:facebook|instagram|linkedin|youtube|youtu\.be|twitter|x\.com|vk\.com|weibo|tiktok|douyin|"
+    r"pinterest|wechat|qq\.com|baidu|google|gstatic|apple|microsoft|alibaba|aliexpress|1688|made-in-china|"
+    r"globalsources|taobao|tmall|jd\.com|amazon|ebay|wikipedia|beian\.gov\.cn|miit\.gov\.cn|cnzz|"
+    r"xing|whatsapp|telegram|t\.me|skype|zhihu|bilibili|indiamart|tradeindia)(?:\.|$)",
+    re.I,
+)
+
+
+def foreign_hosts(html: str, base_url: str) -> Counter[str]:
+    """Other hosts linked from the page, excluding social networks and marketplaces.
+
+    A landing page whose links mostly point at one other host (a brand site that
+    lives on the parent company's domain) is detected with this.
+    """
+
+    base_host = host_key(base_url)
+    counts: Counter[str] = Counter()
+    for attr_s, _ in A_TAG_RE.findall(html or ""):
+        href = unescape((attrs(attr_s).get("href") or "").strip())
+        if not href.lower().startswith(("http://", "https://", "//")):
+            continue
+        host = host_key(abs_url(base_url, href))
+        if host and host != base_host and not SHARED_HOST_RE.search(host):
+            counts[host] += 1
+    return counts
 
 
 def iter_anchors(html: str, base_url: str) -> list[Anchor]:

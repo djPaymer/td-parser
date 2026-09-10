@@ -32,7 +32,7 @@ from app.agents.shapes import (
     structural_siblings,
     templates_regex,
 )
-from app.clients.http.fetch import HtmlFetcher, Page
+from app.clients.http.fetch import Fetcher, Page
 from app.core.config import AgentConfig
 from app.parsers.links import compile_regex, extract_links
 from app.parsers.paginate import detect_page_param
@@ -65,8 +65,26 @@ class AgentError(RuntimeError):
     pass
 
 
+class NoProductShapes(AgentError):
+    """The site was analysed and no URL shape looks like product pages (a brochure / news site)."""
+
+
+class EmptyHtml(AgentError):
+    """The HTML carries (almost) no links: JavaScript-rendered site or a bot wall. A browser may help."""
+
+
 class _Rejected(RuntimeError):
     pass
+
+
+# an LLM "no products here" verdict at least this confident is final; below it the heuristic still gets a try
+LLM_EMPTY_CONFIDENCE = 0.6
+# a rejected LLM pick is sent back with the reason for one more attempt; the heuristic is never used
+# after the LLM has answered, because its pick (the largest remaining shape) tends to be news or blog
+LLM_ROUNDS = 2
+# a shape in the site menu is normally a category list, but small catalogs put every product in the
+# menu: an LLM pick of a menu shape is accepted when its pages are proven leaves and there are few of them
+SMALL_CATALOG = 40
 
 
 @dataclass(slots=True)
@@ -114,11 +132,11 @@ class PatternAgent:
     def has_llm(self) -> bool:
         return self._llm is not None
 
-    async def build_pattern(self, site_url: str, fetcher: HtmlFetcher) -> PatternResult:
+    async def build_pattern(self, site_url: str, fetcher: Fetcher) -> PatternResult:
         crawl = await Explorer(fetcher, self._config.max_pages).run(site_url)
         links_seen = len(crawl.index.links)
         if links_seen < MIN_LINKS_FOR_ANALYSIS:
-            raise AgentError(
+            raise EmptyHtml(
                 f"only {links_seen} internal links found in HTML; "
                 "the site is probably rendered by JavaScript or blocks bots"
             )
@@ -130,33 +148,52 @@ class PatternAgent:
                 f"(pages: {', '.join(p.url for p in crawl.pages)})"
             )
 
-        choices: list[Choice] = []
-        llm_error = ""
-        if self._llm is not None:
-            try:
-                choices.append(await self._ask_llm(crawl, candidates))
-            except LlmError as exc:
-                llm_error = str(exc)
-                log.warning("pattern %s: LLM failed, using heuristics: %s", site_url, exc)
-        choices.append(heuristic_choice(candidates))
-
         errors: list[str] = []
-        tried: set[tuple[int, ...]] = set()
-        for choice in choices:
-            key = tuple(sorted(choice.ids))
-            if not key or key in tried:
-                continue
-            tried.add(key)
+        llm_error = ""
+        llm_answered = False
+        feedback: list[str] = []
+        if self._llm is not None:
+            for _ in range(LLM_ROUNDS):
+                try:
+                    verdict = await self._ask_llm(crawl, candidates, feedback)
+                except LlmError as exc:
+                    llm_error = str(exc)
+                    log.warning("pattern %s: LLM failed, using heuristics: %s", site_url, exc)
+                    break
+                llm_answered = True
+                if not verdict.ids:
+                    if verdict.confidence >= LLM_EMPTY_CONFIDENCE:
+                        # the model saw every candidate and found no product pages; a heuristic pick of the
+                        # single remaining shape (/page{N} of a news site) would only produce garbage rows
+                        raise NoProductShapes(
+                            f"no product pages among {len(candidates)} URL shapes (LLM, {verdict.confidence:.2f}): "
+                            f"{verdict.reason or 'no reason given'}"
+                        )
+                    break
+                try:
+                    result = self._assemble(crawl, candidates, verdict)
+                except _Rejected as exc:
+                    errors.append(f"llm {verdict.ids}: {exc}")
+                    feedback.append(f"shapes {verdict.ids} rejected: {exc}")
+                    log.info("pattern %s: rejected llm choice %s: %s", site_url, verdict.ids, exc)
+                    continue
+                result.meta["rejected"] = errors
+                log.info("pattern %s: %s (llm, %.2f)", site_url, result.pattern.regex, verdict.confidence)
+                return result
+
+        if not llm_answered:
+            # no LLM (or it failed): the heuristic is all there is
+            choice = heuristic_choice(candidates)
             try:
                 result = self._assemble(crawl, candidates, choice)
             except _Rejected as exc:
-                errors.append(f"{choice.source} {list(key)}: {exc}")
-                log.info("pattern %s: rejected %s choice %s: %s", site_url, choice.source, key, exc)
-                continue
-            result.meta["llm_error"] = llm_error or None
-            result.meta["rejected"] = errors
-            log.info("pattern %s: %s (%s, %.2f)", site_url, result.pattern.regex, choice.source, choice.confidence)
-            return result
+                errors.append(f"heuristic {choice.ids}: {exc}")
+                log.info("pattern %s: rejected heuristic choice %s: %s", site_url, choice.ids, exc)
+            else:
+                result.meta["llm_error"] = llm_error or None
+                result.meta["rejected"] = errors
+                log.info("pattern %s: %s (heuristic, %.2f)", site_url, result.pattern.regex, choice.confidence)
+                return result
 
         shapes_seen = "; ".join(f"#{s.id} {s.text} ({s.stats_line()})" for s in candidates[:6])
         hint = ""
@@ -175,9 +212,16 @@ class PatternAgent:
 
     # ------------------------------------------------------------------ LLM
 
-    async def _ask_llm(self, crawl: Crawl, candidates: list[Shape]) -> Choice:
+    async def _ask_llm(self, crawl: Crawl, candidates: list[Shape], feedback: list[str] | None = None) -> Choice:
         assert self._llm is not None
-        payload = await self._llm.json_object(CHOOSER_INSTRUCTIONS, format_candidates(crawl, candidates))
+        prompt = format_candidates(crawl, candidates)
+        if feedback:
+            prompt += (
+                "\n\nYour previous answer was checked against the downloaded pages and rejected:\n- "
+                + "\n- ".join(feedback)
+                + "\nChoose different shape(s), or return an empty list if none of the others are product pages."
+            )
+        payload = await self._llm.json_object(CHOOSER_INSTRUCTIONS, prompt)
         raw_ids = payload.get("product_shapes") or payload.get("shapes") or []
         if isinstance(raw_ids, (int, str)):
             raw_ids = [raw_ids]
@@ -213,7 +257,8 @@ class PatternAgent:
         # drop shapes the crawl has proven to be navigation or category pages
         dropped: list[str] = []
         for shape in list(chosen):
-            if shape.nav_ratio > MAX_NAV_RATIO:
+            menu_ok = choice.source == "llm" and shape.leaf is True and shape.count <= SMALL_CATALOG
+            if shape.nav_ratio > MAX_NAV_RATIO and not menu_ok:
                 dropped.append(f"{shape.text} is site navigation (nav={shape.nav_ratio:.0%})")
             elif shape.leaf is False:
                 dropped.append(f"{shape.text} pages have sub-pages, so they are categories")
